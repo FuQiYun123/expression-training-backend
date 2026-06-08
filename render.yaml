@@ -2,7 +2,6 @@ services:
   - type: web
     name: expression-training-backend
     env: node
-    rootDir: backend
     plan: free
     buildCommand: ""
     startCommand: "node server.js"
