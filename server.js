@@ -466,7 +466,11 @@ async function transcribeAudio(audioData) {
     throw new Error('Missing audio data');
   }
   const form = new FormData();
-  const ext = parsed.mimeType.includes('webm') ? 'webm' : 'm4a';
+  const ext = parsed.mimeType.includes('webm')
+    ? 'webm'
+    : parsed.mimeType.includes('wav')
+      ? 'wav'
+      : 'm4a';
   form.append('file', new Blob([parsed.buffer], { type: parsed.mimeType }), `review.${ext}`);
   form.append('model', process.env.OPENAI_TRANSCRIBE_MODEL || 'gpt-4o-mini-transcribe');
   form.append('language', 'zh');
