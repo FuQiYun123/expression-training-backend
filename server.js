@@ -35,6 +35,7 @@ const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'practice-media';
 const HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const phoneLoginCodes = new Map();
 
 function ensureDataDirs() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -77,6 +78,22 @@ function userIdFrom(value) {
 
 function mediaIdFrom(value) {
   return crypto.createHash('sha256').update(`${Date.now()}:${value}:${crypto.randomUUID()}`).digest('hex').slice(0, 32);
+}
+
+function createPhoneLoginCode(phone) {
+  const code = String(crypto.randomInt(100000, 1000000));
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  phoneLoginCodes.set(phone, { code, expiresAt });
+  return { code, expiresAt };
+}
+
+function verifyPhoneLoginCode(phone, code) {
+  const entry = phoneLoginCodes.get(phone);
+  if (!entry || entry.expiresAt < Date.now() || entry.code !== String(code || '').trim()) {
+    return false;
+  }
+  phoneLoginCodes.delete(phone);
+  return true;
 }
 
 function newestValue(item) {
@@ -519,9 +536,27 @@ async function handleGet(req, res) {
 async function handlePost(req, res) {
   const body = await readBody(req);
 
+  if (req.url === '/api/auth/phone/code') {
+    if (!/^1\d{10}$/.test(body.phone || '')) {
+      sendJson(res, 400, { error: 'Invalid phone' });
+      return;
+    }
+    const result = createPhoneLoginCode(body.phone);
+    sendJson(res, 200, {
+      ok: true,
+      expiresAt: result.expiresAt,
+      code: result.code
+    });
+    return;
+  }
+
   if (req.url === '/api/auth/phone') {
     if (!/^1\d{10}$/.test(body.phone || '')) {
       sendJson(res, 400, { error: 'Invalid phone' });
+      return;
+    }
+    if (!verifyPhoneLoginCode(body.phone, body.code)) {
+      sendJson(res, 401, { error: 'Invalid verification code' });
       return;
     }
     const result = HAS_SUPABASE ? await cloudAuthPhone(body) : await localAuthPhone(body);
