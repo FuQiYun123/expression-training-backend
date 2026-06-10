@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -35,6 +36,9 @@ const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'practice-media';
 const HAS_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || '';
 const phoneLoginCodes = new Map();
 
 function ensureDataDirs() {
@@ -94,6 +98,55 @@ function verifyPhoneLoginCode(phone, code) {
   }
   phoneLoginCodes.delete(phone);
   return true;
+}
+
+function normalizeSmsPhone(phone) {
+  if (/^1\d{10}$/.test(phone)) return `+86${phone}`;
+  return phone;
+}
+
+function sendTwilioSms(phone, code) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
+    return Promise.reject(new Error('SMS provider is not configured'));
+  }
+  const body = new URLSearchParams({
+    To: normalizeSmsPhone(phone),
+    From: TWILIO_FROM_NUMBER,
+    Body: `您的表达训练验证码是 ${code}，10 分钟内有效。`
+  }).toString();
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+  const options = {
+    hostname: 'api.twilio.com',
+    path: `/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Messages.json`,
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(body)
+    }
+  };
+  return new Promise((resolve, reject) => {
+    const request = https.request(options, (response) => {
+      let data = '';
+      response.on('data', (chunk) => {
+        data += chunk;
+      });
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          resolve(data);
+          return;
+        }
+        reject(new Error(`SMS provider failed: ${response.statusCode} ${data}`));
+      });
+    });
+    request.on('error', reject);
+    request.write(body);
+    request.end();
+  });
+}
+
+async function sendPhoneLoginCode(phone, code) {
+  await sendTwilioSms(phone, code);
 }
 
 function newestValue(item) {
@@ -542,11 +595,14 @@ async function handlePost(req, res) {
       return;
     }
     const result = createPhoneLoginCode(body.phone);
-    sendJson(res, 200, {
-      ok: true,
-      expiresAt: result.expiresAt,
-      code: result.code
-    });
+    try {
+      await sendPhoneLoginCode(body.phone, result.code);
+    } catch (error) {
+      phoneLoginCodes.delete(body.phone);
+      sendJson(res, 503, { error: 'SMS provider is not configured or failed' });
+      return;
+    }
+    sendJson(res, 200, { ok: true, expiresAt: result.expiresAt });
     return;
   }
 
