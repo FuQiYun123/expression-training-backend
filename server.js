@@ -357,6 +357,49 @@ async function cloudAuthPhone(body) {
   };
 }
 
+async function localAuthDevice(body) {
+  const db = readDb();
+  const deviceId = String(body.deviceId || '').trim();
+  const id = userIdFrom(`device:${deviceId}`);
+  db.users[id] = db.users[id] || {
+    id,
+    type: 'device',
+    phone: null,
+    name: '表达练习者',
+    createdAt: Date.now()
+  };
+  db.users[id].lastLoginAt = Date.now();
+  const data = localSaveUserData(db, id, body.data);
+  writeDb(db);
+  return { user: db.users[id], data };
+}
+
+async function cloudAuthDevice(body) {
+  const deviceId = String(body.deviceId || '').trim();
+  const id = userIdFrom(`device:${deviceId}`);
+  const now = Date.now();
+  const oldUser = await selectOne('users', `id=eq.${encodeURIComponent(id)}`);
+  const [savedUser] = await upsertRows('users', [{
+    id,
+    type: 'device',
+    phone: null,
+    name: '表达练习者',
+    created_at: oldUser?.created_at || now,
+    last_login_at: now
+  }]);
+  const savedSync = await cloudSaveUserData(id, body.data);
+  return {
+    user: {
+      id: savedUser.id,
+      type: savedUser.type,
+      name: savedUser.name,
+      createdAt: savedUser.created_at,
+      lastLoginAt: savedUser.last_login_at
+    },
+    data: savedSync.data
+  };
+}
+
 async function localAuthWechat(body) {
   const db = readDb();
   const id = userIdFrom(`wechat:${body.code || 'demo'}`);
@@ -616,6 +659,17 @@ async function handlePost(req, res) {
       return;
     }
     const result = HAS_SUPABASE ? await cloudAuthPhone(body) : await localAuthPhone(body);
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (req.url === '/api/auth/device') {
+    const deviceId = String(body.deviceId || '').trim();
+    if (!deviceId || deviceId.length < 16) {
+      sendJson(res, 400, { error: 'Invalid device id' });
+      return;
+    }
+    const result = HAS_SUPABASE ? await cloudAuthDevice(body) : await localAuthDevice(body);
     sendJson(res, 200, result);
     return;
   }
