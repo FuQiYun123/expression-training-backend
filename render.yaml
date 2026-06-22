@@ -14,3 +14,7 @@ services:
         value: practice-media
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_IMPROV_MODEL
+        value: gpt-5.4-mini
+      - key: AI_DAILY_LIMIT
+        value: 30

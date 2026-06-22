@@ -40,6 +40,9 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || '';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || '';
 const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER || '';
 const phoneLoginCodes = new Map();
+const improvUsage = new Map();
+const OPENAI_IMPROV_MODEL = process.env.OPENAI_IMPROV_MODEL || 'gpt-5.4-mini';
+const AI_DAILY_LIMIT = Math.max(1, Number(process.env.AI_DAILY_LIMIT || 30));
 
 function ensureDataDirs() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -603,6 +606,140 @@ async function transcribeAudio(audioData) {
   return result.text || '';
 }
 
+function improvUsageKey(userId) {
+  return `${new Date().toISOString().slice(0, 10)}:${String(userId || 'anonymous')}`;
+}
+
+function consumeImprovQuota(userId) {
+  const key = improvUsageKey(userId);
+  const used = improvUsage.get(key) || 0;
+  if (used >= AI_DAILY_LIMIT) {
+    const error = new Error(`今日 AI 训练次数已达 ${AI_DAILY_LIMIT} 次，请明天再试`);
+    error.statusCode = 429;
+    throw error;
+  }
+  improvUsage.set(key, used + 1);
+  return { used: used + 1, remaining: Math.max(0, AI_DAILY_LIMIT - used - 1) };
+}
+
+function responseOutputText(result) {
+  if (typeof result?.output_text === 'string') return result.output_text;
+  return (result?.output || [])
+    .flatMap((item) => item?.content || [])
+    .map((item) => item?.text || item?.output_text || '')
+    .filter(Boolean)
+    .join('\n');
+}
+
+function assertString(value, field) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`AI output missing ${field}`);
+}
+
+function validateImprovOutput(kind, value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('AI output is not an object');
+  if (kind === 'topic') {
+    ['topicId', 'title', 'background', 'question', 'generatedAt'].forEach((field) => assertString(value[field], field));
+    if (!Array.isArray(value.sources)) throw new Error('AI output missing sources');
+  } else if (kind === 'review') {
+    if (!Array.isArray(value.logicIssues) || !Array.isArray(value.optimizations)) throw new Error('AI review arrays are missing');
+    ['framework', 'sampleSpeech'].forEach((field) => assertString(value[field], field));
+  } else if (kind === 'compare') {
+    ['improvements', 'missingPoints', 'remainingIssues'].forEach((field) => {
+      if (!Array.isArray(value[field])) throw new Error(`AI comparison missing ${field}`);
+    });
+    assertString(value.nextFocus, 'nextFocus');
+  }
+  return value;
+}
+
+const improvSchemas = {
+  topic: {
+    type: 'object', additionalProperties: false,
+    properties: {
+      topicId: { type: 'string' }, title: { type: 'string' }, background: { type: 'string' },
+      question: { type: 'string' }, generatedAt: { type: 'string' },
+      sources: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { title: { type: 'string' }, url: { type: 'string' } }, required: ['title', 'url'] } }
+    },
+    required: ['topicId', 'title', 'background', 'question', 'generatedAt', 'sources']
+  },
+  review: {
+    type: 'object', additionalProperties: false,
+    properties: {
+      logicIssues: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { quote: { type: 'string' }, issue: { type: 'string' }, fix: { type: 'string' } }, required: ['quote', 'issue', 'fix'] } },
+      framework: { type: 'string' }, sampleSpeech: { type: 'string' },
+      optimizations: { type: 'array', items: { type: 'string' } }
+    },
+    required: ['logicIssues', 'framework', 'sampleSpeech', 'optimizations']
+  },
+  compare: {
+    type: 'object', additionalProperties: false,
+    properties: {
+      improvements: { type: 'array', items: { type: 'string' } },
+      missingPoints: { type: 'array', items: { type: 'string' } },
+      remainingIssues: { type: 'array', items: { type: 'string' } },
+      nextFocus: { type: 'string' }
+    },
+    required: ['improvements', 'missingPoints', 'remainingIssues', 'nextFocus']
+  }
+};
+
+async function requestImprovJson(kind, instructions, input, useWebSearch = false) {
+  if (!process.env.OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY');
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const payload = {
+        model: OPENAI_IMPROV_MODEL,
+        instructions,
+        input,
+        text: { format: { type: 'json_schema', name: `improv_${kind}`, strict: true, schema: improvSchemas[kind] } }
+      };
+      if (useWebSearch) payload.tools = [{ type: 'web_search' }];
+      const response = await fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error?.message || 'AI request failed');
+      const text = responseOutputText(result);
+      return validateImprovOutput(kind, JSON.parse(text));
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('AI output could not be parsed');
+}
+
+async function createImprovTopic(body) {
+  consumeImprovQuota(body.userId);
+  const recent = Array.isArray(body.recentTopicIds) ? body.recentTopicIds.slice(0, 20) : [];
+  return requestImprovJson(
+    'topic',
+    '你是中文即兴口语训练教练。检索近期生活、职场、教育、科技、消费、代际或网络文化现象，生成适合普通人表达的题目。严禁时政、公共政策、党派、政治人物及敏感事件评价。题目应开放、有正反空间，不要求专业知识。来源必须是可访问的真实网页。只输出符合结构的 JSON。',
+    `请生成一道新题。最近用过的题目 ID：${recent.join(', ') || '无'}。生成时间使用当前 ISO 日期。背景控制在 80 字内，问题一句话。`,
+    true
+  );
+}
+
+async function reviewImprov(body) {
+  consumeImprovQuota(body.userId);
+  return requestImprovJson(
+    'review',
+    '你是严格但友善的中文口语表达教练。根据题目和逐字稿点评，不虚构用户说过的话。逻辑漏洞必须引用短原话并给修改方法；框架需包含立场、分论点、论据、反方回应和结论；示范稿约三分钟，口语自然；优化点必须可执行。只输出符合结构的 JSON。',
+    `题目：${JSON.stringify(body.topic || {})}\n第一次发言逐字稿：\n${String(body.transcript || '').slice(0, 24000)}`
+  );
+}
+
+async function compareImprov(body) {
+  consumeImprovQuota(body.userId);
+  return requestImprovJson(
+    'compare',
+    '你是中文口语表达教练。对比同一题目的两次发言，具体指出第二次的改善、遗漏、仍需加强之处，并给一个下次最重要的训练重点。不要泛泛鼓励。只输出符合结构的 JSON。',
+    `题目：${JSON.stringify(body.topic || {})}\n首次点评：${JSON.stringify(body.review || {})}\n第一次逐字稿：${String(body.firstTranscript || '').slice(0, 16000)}\n第二次逐字稿：${String(body.secondTranscript || '').slice(0, 16000)}`
+  );
+}
+
 async function handleGet(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
   if (url.pathname === '/api/health') {
@@ -715,6 +852,29 @@ async function handlePost(req, res) {
   if (req.url === '/api/transcribe') {
     const text = await transcribeAudio(body.audioData);
     sendJson(res, 200, { ok: true, text });
+    return;
+  }
+
+  if (req.url === '/api/improv/topic') {
+    sendJson(res, 200, { ok: true, ...(await createImprovTopic(body)) });
+    return;
+  }
+
+  if (req.url === '/api/improv/review') {
+    if (!body.transcript) {
+      sendJson(res, 400, { error: 'Missing transcript' });
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...(await reviewImprov(body)) });
+    return;
+  }
+
+  if (req.url === '/api/improv/compare') {
+    if (!body.firstTranscript || !body.secondTranscript) {
+      sendJson(res, 400, { error: 'Missing transcripts' });
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...(await compareImprov(body)) });
     return;
   }
 
